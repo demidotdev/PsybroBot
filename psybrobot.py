@@ -2,9 +2,7 @@ from email.mime import text
 import os
 import re
 import json
-#import asyncio
 from datetime import datetime, timezone
-from turtle import update
 from urllib.parse import urlparse
 from typing import Optional
 
@@ -22,7 +20,10 @@ ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")  # opcional
 
 # Cargar credenciales de Service Account desde env
 sa_info = json.loads(os.environ["GOOGLE_SHEETS_JSON"])
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
 gclient = gspread.authorize(creds)
 sh = gclient.open_by_key(SHEET_ID)
@@ -36,8 +37,9 @@ def ensure_master_headers():
         ws = sh.worksheet(MASTER_SHEET)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=MASTER_SHEET, rows=100, cols=10)
-    
-    headers = ["Timestamp","SharedBy","SourceChat","MessageLink", "Platform","Artist","Title","URL","Tags","Notes"]
+
+    headers = ["Timestamp","SharedBy","SourceChat","MessageLink",
+               "Platform","Artist","Title","URL","Tags","Notes"]
     try:
         first_row = ws.row_values(1)
         if [h.strip() for h in first_row] != headers:
@@ -50,9 +52,9 @@ def ensure_master_headers():
 ensure_master_headers()
 
 # ---------- Helpers ----------
-def get_display_name(user):
+def get_display_name(user) -> str:
     if user:
-        if user.username:
+        if hasattr(user, "username") and user.username:
             return user.username
         elif hasattr(user, "full_name") and user.full_name:
             return user.full_name
@@ -67,8 +69,8 @@ SOUNDCLOUD_HOSTS = {"soundcloud.com"}
 APPLE_HOSTS = {"apple.com", "music.apple.com"}
 BANDCAMP_HOSTS = {"bandcamp.com"}
 
-
 TAG_RE = re.compile(r"#(?!ascucha\b)\w+")
+
 
 def detect_platform(url: str) -> Optional[str]:
     try:
@@ -87,6 +89,7 @@ def detect_platform(url: str) -> Optional[str]:
         return "bandcamp"
     return None
 
+
 def build_message_link(update: Update) -> str:
     msg = update.effective_message
     chat = update.effective_chat
@@ -99,41 +102,65 @@ def build_message_link(update: Update) -> str:
     # Devolvemos vacío si no es posible construirlo.
     return ""
 
-def row_exists_by_url(url: str) -> bool:
-    ws = sh.worksheet(MASTER_SHEET)
-    urls = ws.col_values(8)  # URL está en la columna 8
+
+def row_exists_by_url_in_sheet(url: str, sheet_name: str) -> bool:
+    try:
+        ws = sh.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        return False
+    urls = ws.col_values(8)  # URL en columna 8 (índice 1-based)
     url_set = {str(u).strip() for u in urls if u is not None}
     return str(url).strip() in url_set
 
-async def append_row(context: ContextTypes.DEFAULT_TYPE, update: Update, *, shared_by: str, source_chat: str,
-                    artist: str, title: str, url: str, message_link: str, tags: str = "", notes: str = ""):
-    ws = sh.worksheet(MASTER_SHEET)
-    platform = detect_platform(url)
-    ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-    row = [ts, shared_by, source_chat, message_link, platform, artist, title, url, tags, notes]
-    row = [x if x is not None else "" for x in row]
+
+async def append_row_to_sheet(sheet_name: str, row: list) -> None:
+    try:
+        ws = sh.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=sheet_name, rows=100, cols=10)
+        headers = ["Timestamp","SharedBy","SourceChat","MessageLink",
+                   "Platform","Artist","Title","URL","Tags","Notes"]
+        ws.append_row(headers, value_input_option=gspread.utils.ValueInputOption.raw)
     ws.append_row(row, value_input_option=gspread.utils.ValueInputOption.raw)
 
-# ---------- Commands ----------
+
+async def append_row(context: ContextTypes.DEFAULT_TYPE, update: Update, *, shared_by: str, source_chat: str,
+                    artist: str, title: str, url: str, message_link: str, tags: str = "", notes: str = "") -> None:
+    platform = detect_platform(url)
+    ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    row = [ts, shared_by, source_chat, message_link,
+           platform, artist, title, url, tags, notes]
+    row = [x if x is not None else "" for x in row]
+
+    # Agrega a la hoja Master si no existe aún
+    if not row_exists_by_url_in_sheet(url, MASTER_SHEET):
+        await append_row_to_sheet(MASTER_SHEET, row)
+
+    # Para cada etiqueta válida, agrega a la hoja correspondiente si no existe el URL
+    if tags:
+        for tag in tags.split():
+            if tag and tag != "#ascucha":
+                # Asumo que la etiqueta NO incluye el '#', si la incluye, quitarlo
+                tag_name = tag.lstrip("#")
+                if tag_name:
+                    if not row_exists_by_url_in_sheet(url, tag_name):
+                        await append_row_to_sheet(tag_name, row)
+
+
+# ---------- Comandos ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
             "¡Listo! Envíame un link o usa /add Artista - Título URL y lo registro en la hoja Master."
         )
 
+
 def extract_notes(text: str, meta: str) -> str:
-    # Extrae hashtags (excluyendo #ascucha)
     tags = set(TAG_RE.findall(text))
-    # Extrae URLs
     urls = set(m.group("url") for m in URL_RE.finditer(text))
-
     meta_words = set(meta.split())
-
-    
-    # Divide el texto en palabras/frases
     fragments = text.split()
-    
-    # Filtra: elimina todo hashtag, URL, o el comando /add
+
     notes = [
         f for f in fragments
         if f not in tags and f not in urls and f not in meta_words and not f.startswith("#") and f != "/add"
@@ -142,124 +169,106 @@ def extract_notes(text: str, meta: str) -> str:
     return " ".join(notes)
 
 
-
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
     text = ((update.message.text if update.message else "") or "").strip()
-    # Formato: /add Artista - Título URL
-    # Partimos por el último token como URL
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
         if update.message:
             await update.message.reply_text("Uso: /add Artista - Título URL")
         return
     payload = parts[1]
-
-    # Extrae URL
     m = URL_RE.search(payload)
     if not m:
         if update.message:
             await update.message.reply_text("No encontré un URL. Formato: /add Artista - Título URL")
         return
     url = m.group("url")
-    # Limpia título/artista antes del URL
     meta = payload[:m.start()].strip()
     artist, title = "", ""
     if " - " in meta:
         artist, title = [s.strip() for s in meta.split(" - ", 1)]
     elif meta:
         title = meta
-        
     platform = detect_platform(url)
     if platform is None:
         if update and update.message:
             await update.message.reply_text("No reconozco la plataforma del URL. Solo YouTube, Spotify, Apple Music, SoundCloud y Bandcamp.")
         return
-
-    if row_exists_by_url(url):
+    if row_exists_by_url_in_sheet(url, MASTER_SHEET):
         if update.message:
             await update.message.reply_text("Ya estaba registrado ✅ (duplicado por URL).")
         return
-    
+
     tags = TAG_RE.findall(text)
     tags_str = " ".join(tags) if tags else ""
-
     notes_str = extract_notes(text, meta)
-
-
 
     user = update.effective_user
     shared_by = get_display_name(user)
     source_chat = ""
-
     if update.effective_chat:
         source_chat = (update.effective_chat.title if update.effective_chat and hasattr(update.effective_chat, "title") and update.effective_chat.title else
                         update.effective_chat.username if update.effective_chat and hasattr(update.effective_chat, "username") and update.effective_chat.username else
                         "")
     message_link = build_message_link(update)
-    
+
     await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
-                    artist=artist, title=title, url=url, message_link=message_link, tags=tags_str, notes=notes_str)
+                    artist=artist, title=title, url=url, message_link=message_link,
+                    tags=tags_str, notes=notes_str)
     if update.message:
         await update.message.reply_text("Anotado en Master ✅")
+
+
 # ---------- Catch-all de mensajes con links ----------
 async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
-
     text = (update.message.text_html if update.message else "") or ""
     urls = [m.group("url") for m in URL_RE.finditer(text)]
     if not urls:
         return
 
-    # Si hay múltiples, registramos todos (filtrando duplicados existentes)
     user = update.effective_user
-    shared_by = (user.username if user and user.username else (user.full_name if user else ""))
+    shared_by = get_display_name(user)
     source_chat = ""
     if update.effective_chat:
         source_chat = getattr(update.effective_chat, "title", None) or getattr(update.effective_chat, "username", None) or ""
     message_link = build_message_link(update)
-
     tags = TAG_RE.findall(text)
     tags_str = " ".join(tags) if tags else ""
-
     notes_str = extract_notes(text, meta="")
-
 
     added = 0
     for url in urls:
         platform = detect_platform(url)
         if platform is None:
             if update.message:
-                await update.message.reply_text(f"No reconozco la plataforma del URL {url}. Solo YouTube, Spotify, Apple Music, SoundCloud y Bandcamp.")    
+                await update.message.reply_text(
+                    f"No reconozco la plataforma del URL {url}. Solo YouTube, Spotify, Apple Music, SoundCloud y Bandcamp.")
             return
-        
-        if row_exists_by_url(url):
+        if row_exists_by_url_in_sheet(url, MASTER_SHEET):
             if update.message:
-                await update.message.reply_text(f"Ya estaba registrado ✅ (duplicado por URL).")
-            return
-
-        await append_row(context, update, shared_by=shared_by, source_chat=source_chat, artist="", title="", url=url,
-                        message_link=message_link, tags=tags_str, notes=notes_str)
+                await update.message.reply_text("Ya estaba registrado ✅ (duplicado por URL).")
+            continue
+        await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
+                        artist="", title="", url=url, message_link=message_link,
+                        tags=tags_str, notes=notes_str)
         added += 1
 
     if added and update.message:
         await update.message.reply_text(f"Registré {added} link(s) en Master ✅")
-    else:
-        if update.message:
-            await update.message.reply_text("No encontré links nuevos de plataformas autorizadas para registrar.")
+    elif update.message:
+        await update.message.reply_text("No encontré links nuevos de plataformas autorizadas para registrar.")
+
 
 # ---------- Main ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_cmd))
-
-    # Mensajes con URL en grupos
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, catch_links))
-
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
