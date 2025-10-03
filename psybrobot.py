@@ -65,7 +65,8 @@ ensure_master_headers()
 
 def ensure_columns(ws, required_cols):
     """
-    Si falta alguna columna, la agrega al final y actualiza los headers.
+    Si faltan columnas en la hoja, las agrega al final y actualiza el encabezado
+    sin borrar toda la fila, para evitar corrupción del encabezado.
     """
     headers = ws.row_values(1)
     added = False
@@ -74,8 +75,8 @@ def ensure_columns(ws, required_cols):
             headers.append(col)
             added = True
     if added:
-        ws.delete_rows(1)
-        ws.insert_row(headers, 1)
+        # Actualiza la fila 1 con los nuevos encabezados completos
+        ws.update("1:1", [headers])
     return headers
 
 # ===========
