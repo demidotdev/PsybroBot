@@ -279,6 +279,7 @@ def extract_notes(text: str, meta: str) -> str:
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Comando /add que registra manualmente un link, infiere los demás datos desde song.link.
+    Procesa solo el primer link válido y agrega el resto de links, incluidos Telegram, en notas.
     """
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
@@ -288,61 +289,37 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message:
             await update.message.reply_text("Uso: /add URL")
         return
-    # Extraer URL
-    url = parts[1].strip()
-    m = URL_RE.search(url)
-    if not m:
+
+    all_urls = [m.group("url") for m in URL_RE.finditer(parts[1])]
+    if not all_urls:
         if update.message:
             await update.message.reply_text("No encontré un URL válido. Formato: /add URL")
         return
-    url = m.group("url")
 
-    # Si es un link de Telegram, lo toma como nota y no lo procesa más
-    if url.startswith("https://t.me/"):
-        tags = TAG_RE.findall(text)
-        tags_str = " ".join(tags) if tags else ""
-        notes_str = url  # Poner el link Telegram en 'Notes'
-        user = update.effective_user
-        shared_by = get_display_name(user)
-        source_chat = ""
-        if update.effective_chat:
-            source_chat = (update.effective_chat.title if update.effective_chat and hasattr(update.effective_chat, "title") and update.effective_chat.title else
-                            update.effective_chat.username if update.effective_chat and hasattr(update.effective_chat, "username") and update.effective_chat.username else
-                            "")
-        message_link = build_message_link(update)
-        await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
-                        artist="", title="", url="", message_link=message_link,  # Deja url vacío, no la registra
-                        tags=tags_str, notes=notes_str, album="", year="")
-        if update.message:
-            await update.message.reply_text("Nota Telegram añadida en Master ✅")
-        return
+    first_url = all_urls[0]
+    rest_urls = all_urls[1:]
 
-    platform = detect_platform(url)
+    platform = detect_platform(first_url)
     if platform is None:
         if update and update.message:
             await update.message.reply_text("No reconozco la plataforma del URL. Solo YouTube, Spotify, Apple Music, SoundCloud y Bandcamp.")
         return
-    if row_exists_by_url_in_sheet(url, MASTER_SHEET):
+    if row_exists_by_url_in_sheet(first_url, MASTER_SHEET):
         if update.message:
             await update.message.reply_text("Ya estaba registrado ✅ (duplicado por URL).")
         return
-  # Extraer etiquetas y separa links Telegram del texto para añadirlos a notas
+
     tags_raw = TAG_RE.findall(text)
     tags = [t for t in tags_raw if t.lower() != "ascucha"]  # excluye 'ascucha'
-    # Extraer todos los links del texto
-    all_urls = [m.group("url") for m in URL_RE.finditer(text)]
-
-    # Links telegram se mantienen en notas; los demás para procesar
-    telegram_links = [u for u in all_urls if u.startswith("https://t.me/") or u.startswith("http://t.me/")]
-    notes_str = extract_notes(text, "")  # Extrae el texto sin hashtags ni URLs excepto los telegram
-    # Añadir links Telegram a las notas
-    if telegram_links:
-        notes_str = (notes_str + " " + " ".join(telegram_links)).strip()
-
     tags_str = " ".join(f"#{t}" for t in tags) if tags else ""
 
-    # Obtener metadata de song.link
-    metadata = get_songlink_metadata(url) or {}
+    # Extrae notas, excluyendo hashtags y URLs excepto links Telegram
+    notes_str = extract_notes(text, "")
+    # Añadir resto de links (primer link ya procesado) a notas
+    if rest_urls:
+        notes_str = (notes_str + " " + " ".join(rest_urls)).strip()
+
+    metadata = get_songlink_metadata(first_url) or {}
     artist = metadata.get("artist", "")
     title = metadata.get("title", "")
     album = metadata.get("album", "")
@@ -356,8 +333,9 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         update.effective_chat.username if update.effective_chat and hasattr(update.effective_chat, "username") and update.effective_chat.username else
                         "")
     message_link = build_message_link(update)
+
     await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
-                    artist=artist, title=title, url=url, message_link=message_link,
+                    artist=artist, title=title, url=first_url, message_link=message_link,
                     tags=tags_str, notes=notes_str, album=album, year=year)
     if update.message:
         await update.message.reply_text("Anotado en Master ✅")
@@ -365,62 +343,59 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handler general de texto: captura cualquier link válido y rellena la metadata automáticamente.
+    Handler general de texto: captura links en mensaje.
+    Procesa solo el primer link válido, agrega el resto (incluidos Telegram) en notas.
     """
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
     text = (update.message.text_html if update.message else "") or ""
-    urls = [m.group("url") for m in URL_RE.finditer(text)]
-    if not urls:
+    all_urls = [m.group("url") for m in URL_RE.finditer(text)]
+    if not all_urls:
         return
+
+    first_url = all_urls[0]
+    rest_urls = all_urls[1:]
+
     user = update.effective_user
     shared_by = get_display_name(user)
     source_chat = ""
     if update.effective_chat:
         source_chat = getattr(update.effective_chat, "title", None) or getattr(update.effective_chat, "username", None) or ""
     message_link = build_message_link(update)
+
     tags_raw = TAG_RE.findall(text)
-    # Excluir "ascucha" de los tags
     tags = [t for t in tags_raw if t.lower() != "ascucha"]
-    tags_str = " ".join(tags) if tags else ""
+    tags_str = " ".join(f"#{t}" for t in tags) if tags else ""
+
     notes_str = extract_notes(text, "")
+    if rest_urls:
+        notes_str = (notes_str + " " + " ".join(rest_urls)).strip()
+
+    platform = detect_platform(first_url)
+    if platform is None:
+        if update.message:
+            await update.message.reply_text(
+                f"No reconozco la plataforma del URL {first_url}. Solo YouTube, Spotify, Apple Music, SoundCloud y Bandcamp.")
+        return
+    if row_exists_by_url_in_sheet(first_url, MASTER_SHEET):
+        if update.message:
+            await update.message.reply_text("Ya estaba registrado ✅ (duplicado por URL).")
+        return
+
+    metadata = get_songlink_metadata(first_url) or {}
+    artist = metadata.get("artist", "")
+    title = metadata.get("title", "")
+    album = metadata.get("album", "")
+    year = metadata.get("year", "")
+
+    await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
+                    artist=artist, title=title, url=first_url, message_link=message_link,
+                    tags=tags_str, notes=notes_str, album=album, year=year)
+
+    if update.message:
+        await update.message.reply_text("Anotado en Master ✅")
 
 
-    # Links telegram se añaden a notas, los demás se procesan como registros separados
-    telegram_links = [u for u in urls if u.startswith("https://t.me/") or u.startswith("http://t.me/")]
-    other_links = [u for u in urls if u not in telegram_links]
-
-    if telegram_links:
-        notes_str = (notes_str + " " + " ".join(telegram_links)).strip()
-
-    added = 0
-    # Procesar los links de plataformas
-    for url in other_links:
-        platform = detect_platform(url)
-        if platform is None:
-            if update.message:
-                await update.message.reply_text(
-                    f"No reconozco la plataforma del URL {url}. Solo YouTube, Spotify, Apple Music, SoundCloud y Bandcamp.")
-            continue
-        if row_exists_by_url_in_sheet(url, MASTER_SHEET):
-            if update.message:
-                await update.message.reply_text("Ya estaba registrado ✅ (duplicado por URL).")
-            continue
-
-        metadata = get_songlink_metadata(url) or {}
-        artist = metadata.get("artist", "")
-        title = metadata.get("title", "")
-        album = metadata.get("album", "")
-        year = metadata.get("year", "")
-        await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
-                        artist=artist, title=title, url=url, message_link=message_link,
-                        tags=tags_str, notes=notes_str, album=album, year=year)
-        added += 1
-
-    if added and update.message:
-        await update.message.reply_text(f"Registré {added} link(s) en Master ✅")
-    elif update.message:
-        await update.message.reply_text("No encontré links nuevos de plataformas autorizadas para registrar.")
 # ===========
 # MAIN: ARMA EL BOT
 # ===========
