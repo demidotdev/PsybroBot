@@ -54,7 +54,7 @@ BANDCAMP_HOSTS = {"bandcamp.com"}
 
 HEADERS_MASTER = [
     "Timestamp","SharedBy","SourceChat","MessageLink",
-    "Platform","Artist","Title","URL","Tags","Notes","Álbum","año"
+    "Platform","Artist","Title","URL","Tags","Notes","Álbum","Año"
 ]
 
 # =============
@@ -213,7 +213,7 @@ async def append_row_to_sheet(sheet_name: str, row: list) -> None:
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=sheet_name, rows=100, cols=len(HEADERS_MASTER))
         ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
-    ensure_columns(ws, ["Álbum", "año"])
+    ensure_columns(ws, ["Álbum", "Año"])
     ws.append_row(row, value_input_option=utils.ValueInputOption.raw)
 
 async def append_row(context: ContextTypes.DEFAULT_TYPE, update: Update, *, shared_by: str, source_chat: str,
