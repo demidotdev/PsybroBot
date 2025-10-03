@@ -1,8 +1,9 @@
-from email.mime import text
 import os
 import re
 import json
 import requests
+from gspread import utils
+
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from typing import Optional
@@ -18,86 +19,66 @@ from google.oauth2.service_account import Credentials
 # CONFIGURACIÓN Y ARRANQUE
 # ========================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-SHEET_ID = os.environ["SHEET_ID"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SHEET_ID = os.environ.get("SHEET_ID")
 ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")  # opcional
 
-# Cargamos credenciales Google Sheets
-sa_info = json.loads(os.environ["GOOGLE_SHEETS_JSON"])
+sa_info = json.loads(os.environ.get("GOOGLE_SHEETS_JSON", "{}"))
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
+
 creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
 gclient = gspread.authorize(creds)
-sh = gclient.open_by_key(SHEET_ID)
+if SHEET_ID:
+    sh = gclient.open_by_key(SHEET_ID)
+else:
+    print("No se ha configurado la variable de entorno SHEET_ID.")
 
-# Definimos el nombre maestro de la hoja central
 MASTER_SHEET = "Master"
+CACHE_URLS_REGISTERED = set()  # Cache para urls ya registradas en el master
 
 # ==========
-# UTILIDADES: Hoja principal y columnas
+# CONSTANTES
 # ==========
 
-def ensure_master_headers():
-    """
-    Se asegura de que la hoja Master exista y tenga los encabezados correctos:
-    Agrega las columnas de artista/álbum/año si no están.
-    """
-    try:
-        ws = sh.worksheet(MASTER_SHEET)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=MASTER_SHEET, rows=100, cols=12)
-    headers = [
-        "Timestamp","SharedBy","SourceChat","MessageLink",
-        "Platform","Artist","Title","URL","Tags","Notes","Álbum","año"
-    ]
-    try:
-        first_row = ws.row_values(1)
-        if [h.strip() for h in first_row] != headers:
-            ws.clear()
-            ws.append_row(headers)
-    except Exception:
-        ws.clear()
-        ws.append_row(headers)
+URL_RE = re.compile(r'(?P<url>(https?://|www\.)[^\s<>\]]+)', re.IGNORECASE)
+TAG_RE = re.compile(r"#(?!ascucha\b)\w+")
 
-ensure_master_headers()
-
-def ensure_columns(ws, required_cols):
-    """
-    Si faltan columnas en la hoja, las agrega al final y actualiza el encabezado
-    sin borrar toda la fila, para evitar corrupción del encabezado.
-    """
-    headers = ws.row_values(1)
-    added = False
-    for col in required_cols:
-        if col not in headers:
-            headers.append(col)
-            added = True
-    if added:
-        # Actualiza la fila 1 con los nuevos encabezados completos
-        ws.update("1:1", [headers])
-    return headers
-
-# ===========
-# REGEX Y AYUDANTES PARA PARSING DE PLATAFORMA, TAGS Y USUARIO
-# ===========
-
-URL_RE = re.compile(
-    r'(?P<url>(https?://|www\.)[^\s<>\]]+)', re.IGNORECASE
-)
 YOUTUBE_HOSTS = {"youtu.be", "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 SPOTIFY_HOSTS = {"open.spotify.com", "spotify.link"}
 SOUNDCLOUD_HOSTS = {"soundcloud.com"}
 APPLE_HOSTS = {"apple.com", "music.apple.com"}
 BANDCAMP_HOSTS = {"bandcamp.com"}
 
-TAG_RE = re.compile(r"#(?!ascucha\b)\w+")
+HEADERS_MASTER = [
+    "Timestamp","SharedBy","SourceChat","MessageLink",
+    "Platform","Artist","Title","URL","Tags","Notes","Álbum","año"
+]
+
+# =============
+# UTILIDADES
+# =============
+
+def get_display_name(user) -> str:
+    if user:
+        if getattr(user, "username", None):
+            return user.username
+        elif getattr(user, "full_name", None):
+            return user.full_name
+    return ""
+
+def get_source_chat(update: Update) -> str:
+    chat = update.effective_chat
+    if chat:
+        if hasattr(chat, "title") and chat.title:
+            return chat.title
+        elif hasattr(chat, "username") and chat.username:
+            return chat.username
+    return ""
 
 def detect_platform(url: str) -> Optional[str]:
-    """
-    Detecta la plataforma del link para normalizar el campo Platform.
-    """
     try:
         host = urlparse(url).netloc.lower()
     except Exception:
@@ -115,9 +96,6 @@ def detect_platform(url: str) -> Optional[str]:
     return None
 
 def build_message_link(update: Update) -> str:
-    """
-    Genera el link directo al mensaje para supergrupos públicos o vacío en otros casos.
-    """
     msg = update.effective_message
     chat = update.effective_chat
     if not chat or chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
@@ -126,50 +104,82 @@ def build_message_link(update: Update) -> str:
         return f"https://t.me/{chat.username}/{msg.message_id}"
     return ""
 
-def get_display_name(user) -> str:
+def normalize_tags(tags: list[str]) -> list[str]:
+    return [t[0].upper() + t[1:].lower() if len(t)>1 else t.upper() for t in tags]
+
+def extract_notes(text: str, meta: str) -> str:
     """
-    Prioriza mostrar el username. Si no lo tiene, el nombre completo.
+    Extrae notas excluyendo hashtags, URLs (excepto links Telegram) y palabras de meta.
     """
-    if user:
-        if hasattr(user, "username") and user.username:
-            return user.username
-        elif hasattr(user, "full_name") and user.full_name:
-            return user.full_name
-    return ""
+    tags = set(TAG_RE.findall(text))
+    urls = set(m.group("url") for m in URL_RE.finditer(text))
+    meta_words = set(meta.split())
+    fragments = text.split()
+
+    notes_fragments = []
+    for f in fragments:
+        f_lower = f.lower()
+        if f in tags or f in urls or f in meta_words or f == "/add" or f.startswith("#") or f_lower == "#ascucha":
+            if f.startswith("https://t.me/") or f.startswith("http://t.me/"):
+                notes_fragments.append(f)
+        else:
+            notes_fragments.append(f)
+
+    return " ".join(notes_fragments)
+
+def ensure_master_headers():
+    try:
+        ws = sh.worksheet(MASTER_SHEET)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=MASTER_SHEET, rows=100, cols=len(HEADERS_MASTER))
+        ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
+        return
+
+    first_row = ws.row_values(1)
+    if [h.strip() for h in first_row] != HEADERS_MASTER:
+        ws.clear()
+        ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
+
+def ensure_columns(ws, required_cols):
+    headers = ws.row_values(1)
+    added = False
+    for col in required_cols:
+        if col not in headers:
+            headers.append(col)
+            added = True
+    if added:
+        ws.update("1:1", [headers])
+    return headers
 
 def row_exists_by_url_in_sheet(url: str, sheet_name: str) -> bool:
-    """
-    Devuelve True si la URL ya está registrada en la hoja sheet_name.
-    """
+    global CACHE_URLS_REGISTERED
+    if sheet_name == MASTER_SHEET and url in CACHE_URLS_REGISTERED:
+        return True
     try:
         ws = sh.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
         return False
-    # URL está en columna 8
     urls = ws.col_values(8)
     url_set = {str(u).strip() for u in urls if u is not None}
+    if sheet_name == MASTER_SHEET:
+        CACHE_URLS_REGISTERED = url_set  # cache actualizado
     return str(url).strip() in url_set
 
-# ===========
-# API Song.link: Extracción de metadata musical multi-plataforma
-# ===========
+# =============
+# API SONG.LINK
+# =============
 
 def get_songlink_metadata(url: str):
-    """
-    Llama a la API song.link y trata de extraer artista, título, álbum y año,
-    priorizando las plataformas con más metadata disponible.
-    """
     api_url = "https://api.song.link/v1-alpha.1/links"
     params = {"url": url}
     try:
-        resp = requests.get(api_url, params=params)
+        resp = requests.get(api_url, params=params, timeout=5)
         resp.raise_for_status()
         data = resp.json()
 
         entities_by_platform = data.get("entitiesByUniqueId", {})
         links_by_platform = data.get("linksByPlatform", {})
 
-        # Orden preferencial de plataformas (puedes modificar este orden)
         for platform in ["spotify", "appleMusic", "youtube", "soundcloud", "bandcamp"]:
             platform_info = links_by_platform.get(platform)
             if platform_info and "entityUniqueId" in platform_info:
@@ -180,8 +190,7 @@ def get_songlink_metadata(url: str):
                 album = entity.get("albumName", "")
                 year = entity.get("year", "")
                 return {"artist": artist, "title": title, "album": album, "year": str(year)}
-        
-        # Si no se encuentra en las plataformas listadas, buscar metadata general
+
         main_entity_id = data.get("pageEntityUniqueId")
         if main_entity_id and main_entity_id in entities_by_platform:
             entity = entities_by_platform.get(main_entity_id, {})
@@ -194,45 +203,31 @@ def get_songlink_metadata(url: str):
         pass
     return {}
 
-# ===========
-# FUNCIONES PARA GUARDAR FILAS EN HOJAS  
-# ===========
+# =============
+# MANEJO DE FILAS EN HOJAS
+# =============
 
 async def append_row_to_sheet(sheet_name: str, row: list) -> None:
-    """
-    Agrega una fila a una hoja del documento Google.
-    Si la hoja no existe, la crea y agrega encabezados básicos (mas tarde se agregan extra con ensure_columns).
-    """
     try:
         ws = sh.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=sheet_name, rows=100, cols=12)
-        headers = [
-            "Timestamp","SharedBy","SourceChat","MessageLink","Platform",
-            "Artist","Title","URL","Tags","Notes","Álbum","año"
-        ]
-        ws.append_row(headers, value_input_option=gspread.utils.ValueInputOption.raw)
+        ws = sh.add_worksheet(title=sheet_name, rows=100, cols=len(HEADERS_MASTER))
+        ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
     ensure_columns(ws, ["Álbum", "año"])
-    ws.append_row(row, value_input_option=gspread.utils.ValueInputOption.raw)
+    ws.append_row(row, value_input_option=utils.ValueInputOption.raw)
 
 async def append_row(context: ContextTypes.DEFAULT_TYPE, update: Update, *, shared_by: str, source_chat: str,
-                     artist: str, title: str, url: str, message_link: str, tags: str = "", notes: str = "",
-                     album: str = "", year: str = "") -> None:
-    """
-    Registra la fila principal en Master, y si hay tags,
-    propaga la misma fila a hojas por tag (una por cada uno).
-    """
+                    artist: str, title: str, url: str, message_link: str, tags: str = "", notes: str = "",
+                    album: str = "", year: str = "") -> None:
     platform = detect_platform(url)
     ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     row = [ts, shared_by, source_chat, message_link,
-           platform, artist, title, url, tags, notes, album, year]
+        platform, artist, title, url, tags, notes, album, year]
     row = [x if x is not None else "" for x in row]
 
-    # Agrega a la hoja Master si no existe aún
     if not row_exists_by_url_in_sheet(url, MASTER_SHEET):
         await append_row_to_sheet(MASTER_SHEET, row)
 
-    # Si tiene tags válidos, también propaga a otras hojas
     if tags:
         for tag in tags.split():
             if tag and tag != "#ascucha":
@@ -242,46 +237,15 @@ async def append_row(context: ContextTypes.DEFAULT_TYPE, update: Update, *, shar
                     if not row_exists_by_url_in_sheet(url, sheet_name):
                         await append_row_to_sheet(sheet_name, row)
 
-# ===========
-# COMANDOS Y HANDLERS DE TELEGRAM
-# ===========
+# =============
+# HANDLERS DE TELEGRAM
+# =============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Inicio del bot, instrucción básica.
-    """
     if update.message:
-        await update.message.reply_text(
-            "¡Listo! Envíame un link o usa /add URL y lo registro en la hoja Master."
-        )
-
-def extract_notes(text: str, meta: str) -> str:
-    """
-    Extrae cualquier comentario textual que no sea hashtag o url.
-    """
-    tags = set(TAG_RE.findall(text))
-    urls = set(m.group("url") for m in URL_RE.finditer(text))
-    meta_words = set(meta.split())
-    fragments = text.split()
-
-    notes_fragments = []
-    for f in fragments:
-        if f in tags or f in urls or f in meta_words or f == "/add" or f.startswith("#") or f.lower() == "#ascucha":
-            # Excluir hashtags normales y todas URLs excepto links Telegram
-            if f.startswith("https://t.me/") or f.startswith("http://t.me/"):
-                # Mantener los links Telegram en notas
-                notes_fragments.append(f)
-            # si no es un link Telegram, excluimos
-        else:
-            notes_fragments.append(f)
-
-    return " ".join(notes_fragments)
+        await update.message.reply_text("¡Listo! Envíame un link o usa /add URL y lo registro en la hoja Master.")
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Comando /add que registra manualmente un link, infiere los demás datos desde song.link.
-    Procesa solo el primer link válido y agrega el resto de links, incluidos Telegram, en notas.
-    """
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
     text = ((update.message.text if update.message else "") or "").strip()
@@ -311,12 +275,10 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tags_raw = TAG_RE.findall(text)
-    tags = [t for t in tags_raw if t.lower() != "ascucha"]  # excluye 'ascucha'
+    tags = [t for t in tags_raw if t.lower() != "ascucha"]
     tags_str = " ".join(f"#{t}" for t in tags) if tags else ""
 
-    # Extrae notas, excluyendo hashtags y URLs excepto links Telegram
     notes_str = extract_notes(text, "")
-    # Añadir resto de links (primer link ya procesado) a notas
     if rest_urls:
         notes_str = (notes_str + " " + " ".join(rest_urls)).strip()
 
@@ -326,13 +288,8 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     album = metadata.get("album", "")
     year = metadata.get("year", "")
 
-    user = update.effective_user
-    shared_by = get_display_name(user)
-    source_chat = ""
-    if update.effective_chat:
-        source_chat = (update.effective_chat.title if update.effective_chat and hasattr(update.effective_chat, "title") and update.effective_chat.title else
-                        update.effective_chat.username if update.effective_chat and hasattr(update.effective_chat, "username") and update.effective_chat.username else
-                        "")
+    shared_by = get_display_name(update.effective_user)
+    source_chat = get_source_chat(update)
     message_link = build_message_link(update)
 
     await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
@@ -341,12 +298,7 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("Anotado en Master ✅")
 
-
 async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler general de texto: captura links en mensaje.
-    Procesa solo el primer link válido, agrega el resto (incluidos Telegram) en notas.
-    """
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
     text = (update.message.text_html if update.message else "") or ""
@@ -357,11 +309,8 @@ async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_url = all_urls[0]
     rest_urls = all_urls[1:]
 
-    user = update.effective_user
-    shared_by = get_display_name(user)
-    source_chat = ""
-    if update.effective_chat:
-        source_chat = getattr(update.effective_chat, "title", None) or getattr(update.effective_chat, "username", None) or ""
+    shared_by = get_display_name(update.effective_user)
+    source_chat = get_source_chat(update)
     message_link = build_message_link(update)
 
     tags_raw = TAG_RE.findall(text)
@@ -396,12 +345,14 @@ async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("Anotado en Master ✅")
 
-
 # ===========
-# MAIN: ARMA EL BOT
+# MAIN
 # ===========
 
 def main():
+    ensure_master_headers()
+    if not BOT_TOKEN:
+        raise ValueError("Bot token no configurado en variable de entorno BOT_TOKEN")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_cmd))
