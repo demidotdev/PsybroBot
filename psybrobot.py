@@ -98,7 +98,7 @@ def detect_platform(url: str) -> Optional[str]:
 def build_message_link(update: Update) -> str:
     msg = update.effective_message
     chat = update.effective_chat
-    if not chat or chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
+    if not chat or chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP, ChatType.PRIVATE):
         return ""
     if chat.username and msg is not None:
         return f"https://t.me/{chat.username}/{msg.message_id}"
