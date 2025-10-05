@@ -45,6 +45,7 @@ CACHE_URLS_REGISTERED = set()  # Cache para urls ya registradas en el master
 
 URL_RE = re.compile(r'(?P<url>(https?://|www\.)[^\s<>\]]+)', re.IGNORECASE)
 TAG_RE = re.compile(r"#(?!ascucha\b)\w+")
+ASC_LINK_RE = re.compile(r'#ascucha\s+((https?://|www\.)[^\s<>\]]+)', re.IGNORECASE)
 
 YOUTUBE_HOSTS = {"youtu.be", "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 SPOTIFY_HOSTS = {"open.spotify.com", "spotify.link"}
@@ -127,11 +128,11 @@ def extract_notes(text: str, meta: str) -> str:
 
     return " ".join(notes_fragments)
 
-def ensure_master_headers():
+def ensure_headers_in_sheet(sheet_name: str):
     try:
-        ws = sh.worksheet(MASTER_SHEET)
+        ws = sh.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=MASTER_SHEET, rows=100, cols=len(HEADERS_MASTER))
+        ws = sh.add_worksheet(title=sheet_name, rows=100, cols=len(HEADERS_MASTER))
         ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
         return
 
@@ -148,7 +149,8 @@ def ensure_columns(ws, required_cols):
             headers.append(col)
             added = True
     if added:
-        ws.update("1:1", [headers])
+        ws.update(range_name="1:1", values=[headers])
+
     return headers
 
 def row_exists_by_url_in_sheet(url: str, sheet_name: str) -> bool:
@@ -209,8 +211,10 @@ def get_songlink_metadata(url: str):
 
 async def append_row_to_sheet(sheet_name: str, row: list) -> None:
     try:
+        ensure_headers_in_sheet(sheet_name)
         ws = sh.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
+        ensure_headers_in_sheet(sheet_name)
         ws = sh.add_worksheet(title=sheet_name, rows=100, cols=len(HEADERS_MASTER))
         ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
     ensure_columns(ws, ["Álbum", "Año"])
@@ -236,6 +240,10 @@ async def append_row(context: ContextTypes.DEFAULT_TYPE, update: Update, *, shar
                     sheet_name = tag_name[0].upper() + tag_name[1:].lower()
                     if not row_exists_by_url_in_sheet(url, sheet_name):
                         await append_row_to_sheet(sheet_name, row)
+    else:
+    # Si no hay tags, añade a la hoja "Undefined"
+            if not row_exists_by_url_in_sheet(url, "Undefined"):
+                await append_row_to_sheet("Undefined", row)
 
 # =============
 # HANDLERS DE TELEGRAM
@@ -302,12 +310,14 @@ async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
     text = (update.message.text_html if update.message else "") or ""
-    all_urls = [m.group("url") for m in URL_RE.finditer(text)]
-    if not all_urls:
-        return
 
-    first_url = all_urls[0]
-    rest_urls = all_urls[1:]
+    # Busca links solo después de #ascucha
+    ascucha_links = [m.group(1) for m in ASC_LINK_RE.finditer(text)]
+    if not ascucha_links:
+        return  # No hay links válidos tras #ascucha, no procesa nada
+
+    first_url = ascucha_links[0]
+    rest_urls = ascucha_links[1:]
 
     shared_by = get_display_name(update.effective_user)
     source_chat = get_source_chat(update)
@@ -350,7 +360,6 @@ async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===========
 
 def main():
-    ensure_master_headers()
     if not BOT_TOKEN:
         raise ValueError("Bot token no configurado en variable de entorno BOT_TOKEN")
     app = Application.builder().token(BOT_TOKEN).build()
