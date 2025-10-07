@@ -448,3 +448,4 @@ if __name__ == "__main__":
     # Registrar webhook SOLO una vez, normalmente fuera de este script o manualmente
     # bot.set_webhook(url=f"https://YOUR_RENDER_SERVICE.onrender.com/webhook")
     uvicorn.run(app, host="0.0.0.0", port=port)
+    
