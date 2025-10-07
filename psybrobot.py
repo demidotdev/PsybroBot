@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from typing import Optional
 
 from fastapi import FastAPI, Request, Response
+from contextlib import asynccontextmanager
 import uvicorn
 
 from telegram import Update
@@ -339,11 +340,25 @@ async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # FASTAPI + Telegram Application para webhooks
 # ====================
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await telegram_app.initialize()
+    await telegram_app.start()
+    print("Bot inicializado correctamente")
+    yield
+    # Shutdown
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+    print("Bot cerrado correctamente")
+
+app = FastAPI(lifespan=lifespan)
+
 app = FastAPI()
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("add", add_cmd))
-telegram_app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, catch_links))
+telegram_app.add_handler(MessageHandler(filters.TEXT, catch_links))
 
 @app.post("/webhook")
 async def webhook(request: Request):
