@@ -1,3 +1,7 @@
+# ========================
+# Librerías externas y configuración general
+# ========================
+
 import os
 import re
 import json
@@ -10,22 +14,29 @@ from fastapi import FastAPI, Request, Response
 import uvicorn
 
 from telegram import Update
-from telegram.constants import ChatType
-from telegram.ext import (Application, ContextTypes, MessageHandler, CommandHandler, filters)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
 
 import gspread
+from gspread import utils
 from google.oauth2.service_account import Credentials
 
 # ========================
-# CONFIGURACIÓN Y ARRANQUE
+# Configuración de entorno y guard clauses globales
 # ========================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-SHEET_ID = os.environ["SHEET_ID"]
-ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")  # opcional
+# Guard clauses para variables críticas
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SHEET_ID = os.environ.get("SHEET_ID")
+GOOGLE_SHEETS_JSON = os.environ.get("GOOGLE_SHEETS_JSON")
+if not BOT_TOKEN or not SHEET_ID or not GOOGLE_SHEETS_JSON:
+    raise RuntimeError("Faltan variables de entorno requeridas: BOT_TOKEN, SHEET_ID o GOOGLE_SHEETS_JSON")
 
-# Cargamos credenciales Google Sheets
-sa_info = json.loads(os.environ["GOOGLE_SHEETS_JSON"])
+ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")  # Opcional
+
+# Inicialización de credenciales y clientes de Google Sheets
+sa_info = json.loads(GOOGLE_SHEETS_JSON)
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -34,41 +45,109 @@ creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
 gclient = gspread.authorize(creds)
 sh = gclient.open_by_key(SHEET_ID)
 
-# Definimos el nombre maestro de la hoja central
 MASTER_SHEET = "Master"
+CACHE_URLS_REGISTERED = set()  # Cache en memoria para evitar duplicados
 
-# ==========
-# UTILIDADES: Hoja principal y columnas
-# ==========
+HEADERS_MASTER = [
+    "Timestamp", "SharedBy", "SourceChat", "MessageLink",
+    "Platform", "Artist", "Title", "URL", "Tags", "Notes", "Álbum", "Año"
+]
 
-def ensure_master_headers():
-    """
-    Se asegura de que la hoja Master exista y tenga los encabezados correctos:
-    Agrega las columnas de artista/álbum/año si no están.
-    """
+# ========================
+# Expresiones regulares y plataformas soportadas
+# ========================
+
+URL_RE = re.compile(r'(?P<url>(https?://|www\.)[^\s<>\]]+)', re.IGNORECASE)
+TAG_RE = re.compile(r"#(?!ascucha\b)\w+")
+ASC_LINK_RE = re.compile(r'#ascucha\s+((https?://|www\.)[^\s<>\]]+)', re.IGNORECASE)
+
+PLATFORM_HOSTS = {
+    "youtube": {"youtu.be", "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"},
+    "spotify": {"open.spotify.com", "spotify.link"},
+    "soundcloud": {"soundcloud.com"},
+    "appleMusic": {"apple.com", "music.apple.com"},
+    "bandcamp": {"bandcamp.com"}
+}
+
+# ========================
+# Utilidades generales
+# ========================
+
+def get_display_name(user) -> str:
+    """Devuelve el username si existe, si no el nombre completo, si no vacío."""
+    if not user:
+        return ""
+    if getattr(user, "username", None):
+        return user.username
+    if getattr(user, "full_name", None):
+        return user.full_name
+    return ""
+
+def get_source_chat(update: Update) -> str:
+    """Devuelve el nombre o username del canal/grupo origen del mensaje."""
+    chat = update.effective_chat
+    if not chat:
+        return ""
+    title = getattr(chat, "title", None)
+    if title:
+        return title
+    username = getattr(chat, "username", None)
+    if username:
+        return username
+    return ""
+
+def detect_platform(url: str) -> Optional[str]:
+    """Detecta la plataforma del link a partir del host de la URL."""
     try:
-        ws = sh.worksheet(MASTER_SHEET)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=MASTER_SHEET, rows=100, cols=12)
-    headers = [
-        "Timestamp","SharedBy","SourceChat","MessageLink",
-        "Platform","Artist","Title","URL","Tags","Notes","Álbum","año"
-    ]
-    try:
-        first_row = ws.row_values(1)
-        if [h.strip() for h in first_row] != headers:
-            ws.clear()
-            ws.append_row(headers)
+        host = urlparse(url).netloc.lower()
+        for platform, hosts in PLATFORM_HOSTS.items():
+            if host in hosts:
+                return platform
     except Exception:
-        ws.clear()
-        ws.append_row(headers)
+        pass
+    return None
 
-ensure_master_headers()
+def build_message_link(update: Update) -> str:
+    """Construye el vínculo al mensaje de Telegram si es un grupo/supergrupo público."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not chat or chat.type not in ("supergroup", "group", "private"):
+        return ""
+    if chat.username and msg is not None:
+        return f"https://t.me/{chat.username}/{msg.message_id}"
+    return ""
+
+def extract_notes(text: str, meta: str = "") -> str:
+    """Extrae notas del texto excluyendo hashtags, URLs y palabras clave, conservando links telegram."""
+    tags = set(TAG_RE.findall(text))
+    urls = set(m.group("url") for m in URL_RE.finditer(text))
+    meta_words = set(meta.split())
+    fragments = text.split()
+    notes_fragments = []
+    for f in fragments:
+        f_lower = f.lower()
+        if f in tags or f in urls or f in meta_words or f == "/add" or f.startswith("#") or f_lower == "#ascucha":
+            if f.startswith("https://t.me/") or f.startswith("http://t.me/"):
+                notes_fragments.append(f)
+        else:
+            notes_fragments.append(f)
+    return " ".join(notes_fragments)
+
+def ensure_headers_in_sheet(sheet_name: str):
+    """Asegura que una hoja tenga los encabezados correctamente y en el orden esperado."""
+    try:
+        ws = sh.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=sheet_name, rows=100, cols=len(HEADERS_MASTER))
+        ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
+        return
+    first_row = ws.row_values(1)
+    if [h.strip() for h in first_row] != HEADERS_MASTER:
+        ws.clear()
+        ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
 
 def ensure_columns(ws, required_cols):
-    """
-    Si falta alguna columna, la agrega al final y actualiza los headers.
-    """
+    """Agrega columnas requeridas si faltan y actualiza encabezados."""
     headers = ws.row_values(1)
     added = False
     for col in required_cols:
@@ -76,212 +155,105 @@ def ensure_columns(ws, required_cols):
             headers.append(col)
             added = True
     if added:
-        ws.delete_rows(1)
-        ws.insert_row(headers, 1)
+        ws.update(range_name="1:1", values=[headers])
     return headers
 
-# ===========
-# REGEX Y AYUDANTES PARA PARSING DE PLATAFORMA, TAGS Y USUARIO
-# ===========
-
-URL_RE = re.compile(
-    r'(?P<url>(https?://|www\.)[^\s<>\]]+)', re.IGNORECASE
-)
-YOUTUBE_HOSTS = {"youtu.be", "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
-SPOTIFY_HOSTS = {"open.spotify.com", "spotify.link"}
-SOUNDCLOUD_HOSTS = {"soundcloud.com"}
-APPLE_HOSTS = {"apple.com", "music.apple.com"}
-BANDCAMP_HOSTS = {"bandcamp.com"}
-
-TAG_RE = re.compile(r"#(?!ascucha\b)\w+")
-
-def detect_platform(url: str) -> Optional[str]:
-    """
-    Detecta la plataforma del link para normalizar el campo Platform.
-    """
-    try:
-        host = urlparse(url).netloc.lower()
-    except Exception:
-        return None
-    if host in YOUTUBE_HOSTS:
-        return "youtube"
-    if host in SPOTIFY_HOSTS:
-        return "spotify"
-    if host in SOUNDCLOUD_HOSTS:
-        return "soundcloud"
-    if host in APPLE_HOSTS:
-        return "appleMusic"
-    if host in BANDCAMP_HOSTS:
-        return "bandcamp"
-    return None
-
-def build_message_link(update: Update) -> str:
-    """
-    Genera el link directo al mensaje para supergrupos públicos o vacío en otros casos.
-    """
-    msg = update.effective_message
-    chat = update.effective_chat
-    if not chat or chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
-        return ""
-    if chat.username and msg is not None:
-        return f"https://t.me/{chat.username}/{msg.message_id}"
-    return ""
-
-def get_display_name(user) -> str:
-    """
-    Prioriza mostrar el username. Si no lo tiene, el nombre completo.
-    """
-    if user:
-        if hasattr(user, "username") and user.username:
-            return user.username
-        elif hasattr(user, "full_name") and user.full_name:
-            return user.full_name
-    return ""
-
 def row_exists_by_url_in_sheet(url: str, sheet_name: str) -> bool:
-    """
-    Devuelve True si la URL ya está registrada en la hoja sheet_name.
-    """
+    """Verifica si una URL ya existe en la hoja dada (para evitar duplicados)."""
+    global CACHE_URLS_REGISTERED
+    if sheet_name == MASTER_SHEET and url in CACHE_URLS_REGISTERED:
+        return True
     try:
         ws = sh.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
         return False
-    # URL está en columna 8
     urls = ws.col_values(8)
-    url_set = {str(u).strip() for u in urls if u is not None}
+    url_set = {str(u).strip() for u in urls if u}
+    if sheet_name == MASTER_SHEET:
+        CACHE_URLS_REGISTERED = url_set  # Actualiza cache
     return str(url).strip() in url_set
 
-# ===========
-# API Song.link: Extracción de metadata musical multi-plataforma
-# ===========
-
-def get_songlink_metadata(url: str):
-    """
-    Llama a la API song.link y trata de extraer artista, título, álbum y año,
-    priorizando las plataformas con más metadata disponible.
-    """
+def get_songlink_metadata(url: str) -> dict:
+    """Obtiene metadatos musicales de song.link priorizando plataformas más populares."""
     api_url = "https://api.song.link/v1-alpha.1/links"
     params = {"url": url}
     try:
-        resp = requests.get(api_url, params=params)
+        resp = requests.get(api_url, params=params, timeout=5)
         resp.raise_for_status()
         data = resp.json()
-
         entities_by_platform = data.get("entitiesByUniqueId", {})
         links_by_platform = data.get("linksByPlatform", {})
-
-        # Orden preferencial de plataformas (puedes modificar este orden)
         for platform in ["spotify", "appleMusic", "youtube", "soundcloud", "bandcamp"]:
-            platform_info = links_by_platform.get(platform)
-            if platform_info and "entityUniqueId" in platform_info:
-                entity_id = platform_info["entityUniqueId"]
-                entity = entities_by_platform.get(entity_id, {})
-                artist = entity.get("artistName", "")
-                title = entity.get("title", "")
-                album = entity.get("albumName", "")
-                year = entity.get("year", "")
-                return {"artist": artist, "title": title, "album": album, "year": str(year)}
-        
-        # Si no se encuentra en las plataformas listadas, buscar metadata general
-        main_entity_id = data.get("pageEntityUniqueId")
-        if main_entity_id and main_entity_id in entities_by_platform:
-            entity = entities_by_platform.get(main_entity_id, {})
-            artist = entity.get("artistName", "")
-            title = entity.get("title", "")
-            album = entity.get("albumName", "")
-            year = entity.get("year", "")
-            return {"artist": artist, "title": title, "album": album, "year": str(year)}
+            info = links_by_platform.get(platform)
+            if info and "entityUniqueId" in info:
+                entity = entities_by_platform.get(info["entityUniqueId"], {})
+                return {
+                    "artist": entity.get("artistName", ""),
+                    "title": entity.get("title", ""),
+                    "album": entity.get("albumName", ""),
+                    "year": str(entity.get("year", ""))
+                }
+        # Fallback genérico
+        main_id = data.get("pageEntityUniqueId")
+        if main_id and main_id in entities_by_platform:
+            entity = entities_by_platform.get(main_id, {})
+            return {
+                "artist": entity.get("artistName", ""),
+                "title": entity.get("title", ""),
+                "album": entity.get("albumName", ""),
+                "year": str(entity.get("year", ""))
+            }
     except Exception:
         pass
     return {}
 
-# ===========
-# FUNCIONES PARA GUARDAR FILAS EN HOJAS  
-# ===========
+# ========================
+# Operaciones de filas en las hojas de Google Sheets
+# ========================
 
-async def append_row_to_sheet(sheet_name: str, row: list) -> None:
-    """
-    Agrega una fila a una hoja del documento Google.
-    Si la hoja no existe, la crea y agrega encabezados básicos (mas tarde se agregan extra con ensure_columns).
-    """
-    try:
-        ws = sh.worksheet(sheet_name)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=sheet_name, rows=100, cols=12)
-        headers = [
-            "Timestamp","SharedBy","SourceChat","MessageLink","Platform",
-            "Artist","Title","URL","Tags","Notes","Álbum","año"
-        ]
-        ws.append_row(headers, value_input_option=gspread.utils.ValueInputOption.raw)
-    ensure_columns(ws, ["Álbum", "año"])
-    ws.append_row(row, value_input_option=gspread.utils.ValueInputOption.raw)
+async def append_row_to_sheet(sheet_name: str, row: list):
+    """Agrega una fila a una hoja, asegurando encabezados y columnas requeridas."""
+    ensure_headers_in_sheet(sheet_name)
+    ws = sh.worksheet(sheet_name)
+    ensure_columns(ws, ["Álbum", "Año"])
+    ws.append_row(row, value_input_option=utils.ValueInputOption.raw)
 
 async def append_row(context: ContextTypes.DEFAULT_TYPE, update: Update, *, shared_by: str, source_chat: str,
                     artist: str, title: str, url: str, message_link: str, tags: str = "", notes: str = "",
-                    album: str = "", year: str = "") -> None:
-    """
-    Registra la fila principal en Master, y si hay tags,
-    propaga la misma fila a hojas por tag (una por cada uno).
-    """
+                    album: str = "", year: str = ""):
+    """Agrega una fila a Master y a las hojas correspondientes según etiquetas."""
     platform = detect_platform(url)
     ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     row = [ts, shared_by, source_chat, message_link,
         platform, artist, title, url, tags, notes, album, year]
     row = [x if x is not None else "" for x in row]
-
-    # Agrega a la hoja Master si no existe aún
     if not row_exists_by_url_in_sheet(url, MASTER_SHEET):
         await append_row_to_sheet(MASTER_SHEET, row)
+    tags_list = tags.split() if tags else []
+    # Early return: Si no hay tags extras, registrar en "Undefined"
+    if not tags_list:
+        if not row_exists_by_url_in_sheet(url, "Undefined"):
+            await append_row_to_sheet("Undefined", row)
+        return
+    for tag in tags_list:
+        if tag and tag != "#ascucha":
+            tag_name = tag.lstrip("#")
+            if tag_name:
+                sheet_name = tag_name[0].upper() + tag_name[1:].lower()
+                if not row_exists_by_url_in_sheet(url, sheet_name):
+                    await append_row_to_sheet(sheet_name, row)
 
-    # Si tiene tags válidos, también propaga a otras hojas
-    if tags:
-        for tag in tags.split():
-            if tag and tag != "#ascucha":
-                tag_name = tag.lstrip("#")
-                if tag_name:
-                    sheet_name = tag_name[0].upper() + tag_name[1:].lower()
-                    if not row_exists_by_url_in_sheet(url, sheet_name):
-                        await append_row_to_sheet(sheet_name, row)
-
-# ===========
-# COMANDOS Y HANDLERS DE TELEGRAM
-# ===========
+# ========================
+# Handlers para telegram - comandos/chat
+# ========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Inicio del bot, instrucción básica.
-    """
+    """Comando /start - Responde con un mensaje de bienvenida e instrucción."""
     if update.message:
-        await update.message.reply_text(
-            "¡Listo! Envíame un link o usa /add URL y lo registro en la hoja Master."
-        )
-
-def extract_notes(text: str, meta: str) -> str:
-    """
-    Extrae cualquier comentario textual que no sea hashtag o url.
-    """
-    tags = set(TAG_RE.findall(text))
-    urls = set(m.group("url") for m in URL_RE.finditer(text))
-    meta_words = set(meta.split())
-    fragments = text.split()
-
-    notes_fragments = []
-    for f in fragments:
-        if f in tags or f in urls or f in meta_words or f == "/add" or f.startswith("#") or f.lower() == "#ascucha":
-            # Excluir hashtags normales y todas URLs excepto links Telegram
-            if f.startswith("https://t.me/") or f.startswith("http://t.me/"):
-                # Mantener los links Telegram en notas
-                notes_fragments.append(f)
-            # si no es un link Telegram, excluimos
-        else:
-            notes_fragments.append(f)
-
-    return " ".join(notes_fragments)
+        await update.message.reply_text("¡Listo! Envíame un link o usa /add URL y lo registro en la hoja Master.")
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Comando /add que registra manualmente un link, infiere los demás datos desde song.link.
-    """
+    """Comando /add - Permite registrar manualmente un enlace con metadatos."""
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
     text = ((update.message.text if update.message else "") or "").strip()
@@ -290,162 +262,100 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message:
             await update.message.reply_text("Uso: /add URL")
         return
-    # Extraer URL
-    url = parts[1].strip()
-    m = URL_RE.search(url)
-    if not m:
+    all_urls = [m.group("url") for m in URL_RE.finditer(parts[1])]
+    if not all_urls:
         if update.message:
             await update.message.reply_text("No encontré un URL válido. Formato: /add URL")
         return
-    url = m.group("url")
-
-    # Si es un link de Telegram, lo toma como nota y no lo procesa más
-    if url.startswith("https://t.me/"):
-        tags = TAG_RE.findall(text)
-        tags_str = " ".join(tags) if tags else ""
-        notes_str = url  # Pone el link Telegram en 'Notes'
-        user = update.effective_user
-        shared_by = get_display_name(user)
-        source_chat = ""
-        if update.effective_chat:
-            source_chat = (update.effective_chat.title if update.effective_chat and hasattr(update.effective_chat, "title") and update.effective_chat.title else
-                            update.effective_chat.username if update.effective_chat and hasattr(update.effective_chat, "username") and update.effective_chat.username else
-                            "")
-        message_link = build_message_link(update)
-        await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
-                        artist="", title="", url="", message_link=message_link,  # Deja url vacío, no la registra
-                        tags=tags_str, notes=notes_str, album="", year="")
+    first_url = all_urls[0]
+    rest_urls = all_urls[1:]
+    platform = detect_platform(first_url)
+    if not platform:
         if update.message:
-            await update.message.reply_text("Nota Telegram añadida en Master ✅")
+            await update.message.reply_text("No reconozco la plataforma del URL.")
         return
-
-    platform = detect_platform(url)
-    if platform is None:
-        if update and update.message:
-            await update.message.reply_text("No reconozco la plataforma del URL. Solo YouTube, Spotify, Apple Music, SoundCloud y Bandcamp.")
-        return
-    if row_exists_by_url_in_sheet(url, MASTER_SHEET):
+    if row_exists_by_url_in_sheet(first_url, MASTER_SHEET):
         if update.message:
             await update.message.reply_text("Ya estaba registrado ✅ (duplicado por URL).")
         return
-  # Extraer etiquetas y separa links Telegram del texto para añadirlos a notas
     tags_raw = TAG_RE.findall(text)
-    tags = [t for t in tags_raw if t.lower() != "ascucha"]  # excluye 'ascucha'
-    # Extraer todos los links del texto
-    all_urls = [m.group("url") for m in URL_RE.finditer(text)]
-
-    # Links telegram se mantienen en notas; los demás para procesar
-    telegram_links = [u for u in all_urls if u.startswith("https://t.me/") or u.startswith("http://t.me/")]
-    notes_str = extract_notes(text, "")  # Extrae el texto sin hashtags ni URLs excepto los telegram
-    # Añadir links Telegram a las notas
-    if telegram_links:
-        notes_str = (notes_str + " " + " ".join(telegram_links)).strip()
-
+    tags = [t for t in tags_raw if t.lower() != "ascucha"]
     tags_str = " ".join(f"#{t}" for t in tags) if tags else ""
-
-    # Obtener metadata de song.link
-    metadata = get_songlink_metadata(url) or {}
-    artist = metadata.get("artist", "")
-    title = metadata.get("title", "")
-    album = metadata.get("album", "")
-    year = metadata.get("year", "")
-
-    user = update.effective_user
-    shared_by = get_display_name(user)
-    source_chat = ""
-    if update.effective_chat:
-        source_chat = (update.effective_chat.title if update.effective_chat and hasattr(update.effective_chat, "title") and update.effective_chat.title else
-                        update.effective_chat.username if update.effective_chat and hasattr(update.effective_chat, "username") and update.effective_chat.username else
-                        "")
+    notes_str = extract_notes(text, "")
+    if rest_urls:
+        notes_str = (notes_str + " " + " ".join(rest_urls)).strip()
+    metadata = get_songlink_metadata(first_url) or {}
+    shared_by = get_display_name(update.effective_user)
+    source_chat = get_source_chat(update)
     message_link = build_message_link(update)
     await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
-                    artist=artist, title=title, url=url, message_link=message_link,
-                    tags=tags_str, notes=notes_str, album=album, year=year)
+                    artist=metadata.get("artist", ""), title=metadata.get("title", ""),
+                    url=first_url, message_link=message_link,
+                    tags=tags_str, notes=notes_str,
+                    album=metadata.get("album", ""), year=metadata.get("year", ""))
     if update.message:
         await update.message.reply_text("Anotado en Master ✅")
 
-
 async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler general de texto: captura cualquier link válido y rellena la metadata automáticamente.
-    """
+    """Handler que captura mensajes de texto con links precedidos por #ascucha."""
     if ALLOWED_CHAT_ID and (not update.effective_chat or str(update.effective_chat.id) != str(ALLOWED_CHAT_ID)):
         return
     text = (update.message.text_html if update.message else "") or ""
-    urls = [m.group("url") for m in URL_RE.finditer(text)]
-    if not urls:
+    ascucha_links = [m.group(1) for m in ASC_LINK_RE.finditer(text)]
+    if not ascucha_links:
         return
-    user = update.effective_user
-    shared_by = get_display_name(user)
-    source_chat = ""
-    if update.effective_chat:
-        source_chat = getattr(update.effective_chat, "title", None) or getattr(update.effective_chat, "username", None) or ""
+    first_url = ascucha_links[0]
+    rest_urls = ascucha_links[1:]
+    shared_by = get_display_name(update.effective_user)
+    source_chat = get_source_chat(update)
     message_link = build_message_link(update)
     tags_raw = TAG_RE.findall(text)
-    # Excluir "ascucha" de los tags
     tags = [t for t in tags_raw if t.lower() != "ascucha"]
-    tags_str = " ".join(tags) if tags else ""
+    tags_str = " ".join(f"#{t}" for t in tags) if tags else ""
     notes_str = extract_notes(text, "")
-
-
-    # Links telegram se añaden a notas, los demás se procesan como registros separados
-    telegram_links = [u for u in urls if u.startswith("https://t.me/") or u.startswith("http://t.me/")]
-    other_links = [u for u in urls if u not in telegram_links]
-
-    if telegram_links:
-        notes_str = (notes_str + " " + " ".join(telegram_links)).strip()
-
-    added = 0
-    # Procesar los links de plataformas
-    for url in other_links:
-        platform = detect_platform(url)
-        if platform is None:
-            if update.message:
-                await update.message.reply_text(
-                    f"No reconozco la plataforma del URL {url}. Solo YouTube, Spotify, Apple Music, SoundCloud y Bandcamp.")
-            continue
-        if row_exists_by_url_in_sheet(url, MASTER_SHEET):
-            if update.message:
-                await update.message.reply_text("Ya estaba registrado ✅ (duplicado por URL).")
-            continue
-
-        metadata = get_songlink_metadata(url) or {}
-        artist = metadata.get("artist", "")
-        title = metadata.get("title", "")
-        album = metadata.get("album", "")
-        year = metadata.get("year", "")
-        await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
-                        artist=artist, title=title, url=url, message_link=message_link,
-                        tags=tags_str, notes=notes_str, album=album, year=year)
-        added += 1
-
-    if added and update.message:
-        await update.message.reply_text(f"Registré {added} link(s) en Master ✅")
-    elif update.message:
-        await update.message.reply_text("No encontré links nuevos de plataformas autorizadas para registrar.")
+    if rest_urls:
+        notes_str = (notes_str + " " + " ".join(rest_urls)).strip()
+    platform = detect_platform(first_url)
+    if not platform:
+        if update.message:
+            await update.message.reply_text(
+                f"No reconozco la plataforma del URL {first_url}."
+            )
+        return
+    if row_exists_by_url_in_sheet(first_url, MASTER_SHEET):
+        if update.message:
+            await update.message.reply_text("Ya estaba registrado ✅ (duplicado por URL).")
+        return
+    metadata = get_songlink_metadata(first_url) or {}
+    await append_row(context, update, shared_by=shared_by, source_chat=source_chat,
+                    artist=metadata.get("artist", ""), title=metadata.get("title", ""),
+                    url=first_url, message_link=message_link,
+                    tags=tags_str, notes=notes_str,
+                    album=metadata.get("album", ""), year=metadata.get("year", ""))
+    if update.message:
+        await update.message.reply_text("Anotado en Master ✅")
 
 # ====================
-# FASTAPI Y TELEGRAM INTEGRACION
+# FASTAPI + Telegram Application para webhooks
 # ====================
 
 app = FastAPI()
 telegram_app = Application.builder().token(BOT_TOKEN).build()
-
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("add", add_cmd))
 telegram_app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, catch_links))
-@app.post("/webhook")
 
+@app.post("/webhook")
 async def webhook(request: Request):
-    json_update = await request.json()
-    update = Update.de_json(json_update, telegram_app.bot)
-    await telegram_app.update_queue.put(update)  # Enviar la actualización al Application
+    """Endpoint webhook para recibir eventos desde Telegram y ponerlos en la cola del bot."""
+    try:
+        json_update = await request.json()
+        update = Update.de_json(json_update, telegram_app.bot)
+        await telegram_app.update_queue.put(update)
+    except Exception as e:
+        return Response(content=f"Error: {str(e)}", status_code=400)
     return Response(content="ok", status_code=200)
 
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    # Registrar webhook SOLO una vez, normalmente fuera de este script o manualmente
-    # bot.set_webhook(url=f"https://YOUR_RENDER_SERVICE.onrender.com/webhook")
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
