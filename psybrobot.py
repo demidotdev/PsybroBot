@@ -335,43 +335,76 @@ async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     album=metadata.get("album", ""), year=metadata.get("year", ""))
     if update.message:
         await update.message.reply_text("Anotado en Master ✅")
+# ====================
+# FASTAPI + Telegram Application para webhooks con lifespan
+# ====================
 
-# ====================
-# FASTAPI + Telegram Application para webhooks
-# ====================
+from contextlib import asynccontextmanager
+
+# Inicialización global de la aplicación de Telegram
+telegram_app = None
+
+async def init_telegram_app():
+    """Inicializa la aplicación de Telegram de forma segura."""
+    global telegram_app
+    if telegram_app is None:
+        telegram_app = Application.builder().token(BOT_TOKEN if BOT_TOKEN is not None else "").build()
+        telegram_app.add_handler(CommandHandler("start", start))
+        telegram_app.add_handler(CommandHandler("add", add_cmd))
+        telegram_app.add_handler(MessageHandler(filters.TEXT, catch_links))  # Sin restricción de grupos
+        await telegram_app.initialize()
+        await telegram_app.start()
+        print("✅ Bot inicializado correctamente")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    await telegram_app.initialize()
-    await telegram_app.start()
-    print("Bot inicializado correctamente")
-    yield
-    # Shutdown
-    await telegram_app.stop()
-    await telegram_app.shutdown()
-    print("Bot cerrado correctamente")
+    """Gestión del ciclo de vida de la aplicación FastAPI."""
+    # Startup - Inicialización
+    await init_telegram_app()
+    print("🚀 FastAPI iniciado con bot de Telegram")
+    
+    yield  # Aquí la aplicación está activa
+    
+    # Shutdown - Limpieza
+    global telegram_app
+    if telegram_app:
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+        print("✅ Bot cerrado correctamente")
+    print("🛑 FastAPI cerrado")
 
+# Crear la aplicación FastAPI con lifespan
 app = FastAPI(lifespan=lifespan)
-
-app = FastAPI()
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("add", add_cmd))
-telegram_app.add_handler(MessageHandler(filters.TEXT, catch_links))
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Endpoint webhook para recibir eventos desde Telegram y ponerlos en la cola del bot."""
+    """Endpoint webhook para recibir eventos desde Telegram."""
+    global telegram_app
+    
+    # Guard clause: verificar inicialización
+    if not telegram_app:
+        await init_telegram_app()
+    
     try:
         json_update = await request.json()
-        update = Update.de_json(json_update, telegram_app.bot)
-        await telegram_app.process_update(update)
+        if telegram_app:
+            update = Update.de_json(json_update, telegram_app.bot)
+            await telegram_app.process_update(update)
+            return Response(content="ok", status_code=200)
+        else:
+            # Handle the case when telegram_app is None
+            # For example, you can return an error response or log an error message
+            return Response(content="Error: Telegram app is not initialized", status_code=500)
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"❌ Error webhook: {str(e)}")
         return Response(content=f"Error: {str(e)}", status_code=400)
-    return Response(content="ok", status_code=200)
+
+@app.get("/")
+async def root():
+    """Endpoint de salud para verificar que el servicio está activo."""
+    return {"status": "Bot activo", "webhook": "/webhook"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+    print(f"✅ FastAPI iniciado en http://localhost:{port}")
