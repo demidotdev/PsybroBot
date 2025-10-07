@@ -345,7 +345,7 @@ telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("add", add_cmd))
 telegram_app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, catch_links))
 
-@app.post("https://pybots.onrender.com/webhook")
+@app.post("/webhook")
 async def webhook(request: Request):
     """Endpoint webhook para recibir eventos desde Telegram y ponerlos en la cola del bot."""
     try:
