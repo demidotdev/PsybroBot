@@ -386,8 +386,6 @@ async def webhook(request: Request):
             await telegram_app.process_update(update)
             return Response(content="ok", status_code=200)
         else:
-            # Handle the case when telegram_app is None
-            # For example, you can return an error response or log an error message
             return Response(content="Error: Telegram app is not initialized", status_code=500)
     except Exception as e:
         print(f"❌ Error webhook: {str(e)}")
