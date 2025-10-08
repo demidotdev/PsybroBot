@@ -1,7 +1,3 @@
-# ========================
-# Librerías externas y configuración general
-# ========================
-
 import os
 import re
 import json
@@ -338,8 +334,6 @@ async def catch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ====================
 # FASTAPI + Telegram Application para webhooks con lifespan
 # ====================
-
-from contextlib import asynccontextmanager
 
 # Inicialización global de la aplicación de Telegram
 telegram_app = None
