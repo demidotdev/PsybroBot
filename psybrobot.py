@@ -318,8 +318,7 @@ def ensure_headers_in_sheet(sheet_name: str):
         return
     first_row = ws.row_values(1)
     if [h.strip() for h in first_row] != HEADERS_MASTER:
-        ws.clear()
-        ws.append_row(HEADERS_MASTER, value_input_option=utils.ValueInputOption.raw)
+        ws.update(range_name="1:1", values=[HEADERS_MASTER])
 
 def ensure_columns(ws, required_cols):
     """Agrega columnas requeridas si faltan y actualiza encabezados."""
